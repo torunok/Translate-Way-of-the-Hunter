@@ -12,7 +12,9 @@ export class DeepLTranslator {
     glossaryJson: string = "{}"
   ): Promise<{ id: number; translation: string; confidence: number; critique?: string }[]> {
     
-    if (!apiKey) {
+    // Fix: Prioritize provided apiKey, but fallback to process.env.DEEPL_API_KEY
+    const key = apiKey || process.env.DEEPL_API_KEY;
+    if (!key) {
         throw new Error("DeepL API Key is missing.");
     }
 
@@ -27,13 +29,10 @@ export class DeepLTranslator {
 
     // Prepare text with context injection
     // Strategy: We prepend "<glue>Term=Translation</glue>" and tell DeepL to ignore 'glue' tags.
-    // DeepL sees the context but outputs the tag untranslated, allowing us to strip it later.
     const processedItems = items.map(item => {
         const source = item.source;
         // Find matching glossary terms in this specific string
         const matches = glossaryEntries.filter(([eng, _]) => {
-            // Simple word boundary check to avoid partial matches (e.g. 'car' in 'carpet')
-            // Escaping regex special chars is a good practice, simplifying here for performance
             const regex = new RegExp(`\\b${eng}\\b`, 'i');
             return regex.test(source);
         });
@@ -51,11 +50,11 @@ export class DeepLTranslator {
             originalSource: source,
             textToSend,
             hasGlossaryMatch: matches.length > 0,
-            matches: matches.map(m => m[0]) // Store which terms matched for logging/debug if needed
+            matches: matches.map(m => m[0])
         };
     });
 
-    const isFree = apiKey.endsWith(':fx');
+    const isFree = key.endsWith(':fx');
     const endpoint = isFree 
         ? 'https://api-free.deepl.com/v2/translate' 
         : 'https://api.deepl.com/v2/translate';
@@ -64,7 +63,7 @@ export class DeepLTranslator {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
-          'Authorization': `DeepL-Auth-Key ${apiKey}`,
+          'Authorization': `DeepL-Auth-Key ${key}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -89,20 +88,16 @@ export class DeepLTranslator {
         const meta = processedItems[index];
         let cleanedTranslation = t.text;
 
-        // Clean up the XML tag from response if DeepL preserved it (it usually does)
-        // Regex looks for <glue>...</glue> and removes it, plus any leading whitespace
+        // Clean up the XML tag from response if DeepL preserved it
         cleanedTranslation = cleanedTranslation.replace(/<glue>.*?<\/glue>\s*/gi, '');
 
         // Infer confidence
-        // If we had glossary matches, we are more confident (100%).
-        // Standard DeepL translation is usually high quality, say 90-95%.
         const confidence = meta.hasGlossaryMatch ? 100 : 90;
 
         return {
           id: Number(meta.id),
           translation: cleanedTranslation.trim(),
           confidence: confidence,
-          // We don't get a critique from DeepL, but we can leave a note if glossary was used
           critique: meta.hasGlossaryMatch 
             ? `Used glossary terms: ${meta.matches.join(', ')}` 
             : undefined

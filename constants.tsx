@@ -5,7 +5,7 @@ export const INITIAL_GLOSSARY: Record<string, string> = {
     "Red Deer": "Олень благородний",
     "Brown Bear": "Ведмідь бурий",
     "Bighorn Sheep": "Товсторіг",
-    "Black Bear": "Барибал",
+    "Black Bear": "Чорний ведмідь",
     "Mule Deer": "Олень чорнохвостий",
     "Whitetail Deer": "Олень білохвостий",
     "Elk": "Вапіті",

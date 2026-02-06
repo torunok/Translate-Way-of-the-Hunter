@@ -5,20 +5,20 @@ import { SYSTEM_INSTRUCTION_BASE } from "../constants";
 
 export class GeminiTranslator {
   /**
-   * Перекладає або валідує батч елементів.
-   * Якщо елемент вже має переклад (наприклад, після ручного редагування), 
-   * модель фокусується на його перевірці та покращенні.
+   * Перекладає або валідує батч елементів за допомогою вибраної моделі Gemini.
    */
   async translateBatch(
     items: TranslationItem[], 
     glossaryJson: string, 
-    apiKey?: string,
-    model: string = 'gemini-3-flash-preview'
+    model: string = 'gemini-3-pro-preview',
+    apiKey?: string
   ): Promise<{ id: number; translation: string; confidence: number; critique?: string }[]> {
     
+    // Prioritize passed key (UI), fallback to env var
     const key = apiKey || process.env.API_KEY;
+    
     if (!key) {
-        throw new Error("API Key is missing. Please enter it in the configuration.");
+        throw new Error("API Key is missing. Please enter it in the settings or configure process.env.API_KEY.");
     }
 
     const ai = new GoogleGenAI({ apiKey: key });
@@ -44,11 +44,11 @@ export class GeminiTranslator {
 
     try {
       const response = await ai.models.generateContent({
-        model,
+        model: model,
         contents: `Process the following game strings. If a translation is provided, validate and improve it. Otherwise, translate from scratch. IMPORTANT: Preserve specific formatting (newlines, spacing) from the source:\n${JSON.stringify(promptItems)}`,
         config: {
           systemInstruction,
-          temperature: 0.1, // Більш стабільні результати для валідації
+          temperature: 0.1,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.ARRAY,
@@ -82,7 +82,8 @@ export class GeminiTranslator {
       const text = response.text;
       if (!text) throw new Error("Empty response from Gemini");
       
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      return Array.isArray(parsed) ? parsed : [];
     } catch (error: any) {
       if (error.message?.includes("429") || error.message?.includes("RESOURCE_EXHAUSTED")) {
         throw new Error("RATE_LIMIT");
