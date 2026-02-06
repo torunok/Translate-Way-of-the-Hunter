@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Linguist Pro: Game Localization Engine",
+  "description": "A high-performance web-based localization dashboard for 'Way of the Hunter' and other games, featuring smart batching, glossary compliance, and rate-limit management using Gemini API.",
+  "requestFramePermissions": []
+}
