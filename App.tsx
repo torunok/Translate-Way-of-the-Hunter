@@ -1,13 +1,67 @@
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { INITIAL_GLOSSARY } from './constants';
 import { TranslationItem, LocalizationStats, TranslationMemory, FileEntry, ToastMessage } from './types';
 import { GeminiTranslator } from './services/geminiService';
+import { DeepLTranslator } from './services/deeplService';
 import GlossaryManager from './components/GlossaryManager';
 
-const BATCH_SIZE = 5; 
 const WAIT_TIME_MS = 4000; 
 const RATE_LIMIT_WAIT_MS = 65000;
 const MAX_FILES = 50;
+
+/**
+ * Robust CSV Parser that handles quoted fields with newlines and commas.
+ */
+const parseCSV = (text: string): string[][] => {
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentCell = '';
+  let inQuotes = false;
+  
+  // Normalize line endings to \n
+  const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  
+  for (let i = 0; i < cleanText.length; i++) {
+    const char = cleanText[i];
+    const nextChar = cleanText[i + 1];
+    
+    if (inQuotes) {
+      if (char === '"') {
+        if (nextChar === '"') {
+          currentCell += '"';
+          i++; // Skip escaped quote
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        currentCell += char;
+      }
+    } else {
+      if (char === '"') {
+        inQuotes = true;
+      } else if (char === ',') {
+        currentRow.push(currentCell);
+        currentCell = '';
+      } else if (char === '\n') {
+        currentRow.push(currentCell);
+        rows.push(currentRow);
+        currentRow = [];
+        currentCell = '';
+      } else {
+        currentCell += char;
+      }
+    }
+  }
+  
+  // Handle the last cell/row
+  if (currentCell || currentRow.length > 0) {
+    currentRow.push(currentCell);
+    rows.push(currentRow);
+  }
+  
+  return rows;
+};
 
 const App: React.FC = () => {
   const [glossary, setGlossary] = useState<Record<string, string>>(INITIAL_GLOSSARY);
@@ -21,24 +75,67 @@ const App: React.FC = () => {
     const saved = localStorage.getItem('linguist_tm');
     return saved ? JSON.parse(saved) : {};
   });
-  const [stats, setStats] = useState<LocalizationStats>({
-    totalFiles: 0,
-    completedFiles: 0,
-    totalStrings: 0,
-    completedStrings: 0,
+  
+  // Settings State
+  const [batchSize, setBatchSize] = useState<number>(5);
+  const [serviceType, setServiceType] = useState<'gemini' | 'deepl'>('gemini');
+
+  // Cumulative stats (events that happen over time)
+  const [eventStats, setEventStats] = useState({
     cachedStrings: 0,
     apiCalls: 0,
     errors: 0
   });
+
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [cooldown, setCooldown] = useState(0);
-  const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') || '');
+
+  // API KEYS MANAGEMENT
+  // Gemini Keys (Rotatable)
+  const [geminiKeysInput, setGeminiKeysInput] = useState<string>(() => localStorage.getItem('gemini_api_key') || '');
+  // DeepL Key (Single)
+  const [deepLKeyInput, setDeepLKeyInput] = useState<string>(() => localStorage.getItem('deepl_api_key') || '');
+
+  const geminiKeys = useMemo(() => {
+    return geminiKeysInput.split(',').map(k => k.trim()).filter(k => k.length > 0);
+  }, [geminiKeysInput]);
+  
+  const activeKeyIndexRef = useRef(0);
 
   const fileResultsRef = useRef<Record<string, TranslationItem[]>>({});
-  const translatorRef = useRef<GeminiTranslator | null>(null);
+  
+  // Services
+  const geminiTranslatorRef = useRef<GeminiTranslator | null>(null);
+  const deepLTranslatorRef = useRef<DeepLTranslator | null>(null);
+  
+  const shouldStopRef = useRef(false);
+
+  // REACTIVE STATISTICS
+  const stats = useMemo<LocalizationStats>(() => {
+    const totalFiles = fileQueue.length;
+    const completedFiles = fileQueue.filter(f => f.status === 'done').length;
+    const totalStrings = fileQueue.reduce((acc, f) => acc + (f.totalItems || 0), 0);
+    const completedStrings = fileQueue.reduce((acc, f) => acc + (f.completedItems || 0), 0);
+    
+    return {
+        totalFiles,
+        completedFiles,
+        totalStrings,
+        completedStrings,
+        cachedStrings: eventStats.cachedStrings,
+        apiCalls: eventStats.apiCalls,
+        errors: eventStats.errors
+    };
+  }, [fileQueue, eventStats]);
+
+  const sessionPercentage = useMemo(() => {
+    if (stats.totalStrings === 0) return 0;
+    return Math.min(100, Math.round((stats.completedStrings / stats.totalStrings) * 100));
+  }, [stats.completedStrings, stats.totalStrings]);
 
   useEffect(() => {
-    translatorRef.current = new GeminiTranslator();
+    geminiTranslatorRef.current = new GeminiTranslator();
+    deepLTranslatorRef.current = new DeepLTranslator();
   }, []);
 
   useEffect(() => {
@@ -86,7 +183,6 @@ const App: React.FC = () => {
     } as any));
 
     setFileQueue(prev => [...prev, ...newFiles]);
-    setStats(prev => ({ ...prev, totalFiles: prev.totalFiles + csvFiles.length }));
     addToast(`Додано ${csvFiles.length} файл(ів)`);
   };
 
@@ -95,10 +191,58 @@ const App: React.FC = () => {
     const targetIndex = index + direction;
     if (targetIndex < 0 || targetIndex >= newQueue.length) return;
     
-    // Don't allow moving a file that is currently processing or already done past pending files if it breaks logical flow, 
-    // but usually user just wants to reorder pending tasks.
     [newQueue[index], newQueue[targetIndex]] = [newQueue[targetIndex], newQueue[index]];
+    
+    if (currentFileIndex === index) {
+        setCurrentFileIndex(targetIndex);
+    } else if (currentFileIndex === targetIndex) {
+        setCurrentFileIndex(index);
+    }
+    
     setFileQueue(newQueue);
+  };
+
+  const deleteFile = (index: number) => {
+    if (index === currentFileIndex && isProcessing) {
+        addToast("Не можна видалити файл, що обробляється", "error");
+        return;
+    }
+
+    const fileToRemove = fileQueue[index];
+    
+    if (fileResultsRef.current[fileToRemove.name]) {
+        delete fileResultsRef.current[fileToRemove.name];
+    }
+
+    const newQueue = fileQueue.filter((_, i) => i !== index);
+    setFileQueue(newQueue);
+
+    if (index === currentFileIndex) {
+        setCurrentFileIndex(-1);
+        setCurrentItems([]);
+    } else if (index < currentFileIndex) {
+        setCurrentFileIndex(currentFileIndex - 1);
+    }
+
+    addToast("Файл видалено з черги", "info");
+  };
+
+  const handleRetryFile = (index: number) => {
+    if (isProcessing) return;
+    
+    setFileQueue(prev => prev.map((f, i) => i === index ? { ...f, status: 'pending' } : f));
+    
+    const fileName = fileQueue[index].name;
+    if (fileResultsRef.current[fileName]) {
+        fileResultsRef.current[fileName] = fileResultsRef.current[fileName].map(item => 
+            (item.status === 'failed' || !item.target) ? { ...item, status: 'pending' } : item
+        );
+        if (index === currentFileIndex) {
+            setCurrentItems(fileResultsRef.current[fileName]);
+        }
+    }
+    
+    addToast("Файл позначено для повторної обробки");
   };
 
   const handleFilesUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -123,22 +267,45 @@ const App: React.FC = () => {
   };
 
   const processFileMetadata = async (fileEntry: any) => {
+    if (fileResultsRef.current[fileEntry.name]) {
+        return fileResultsRef.current[fileEntry.name];
+    }
+
     return new Promise<TranslationItem[]>((resolve) => {
       const reader = new FileReader();
       reader.onload = (event) => {
         const text = event.target?.result as string;
-        const lines = text.split('\n');
-        const header = lines[0].split(',');
+        const rows = parseCSV(text);
+        if (rows.length === 0) {
+            resolve([]);
+            return;
+        }
+
+        const header = rows[0];
         const keyIdx = header.findIndex(h => h.trim().toLowerCase() === 'key');
         const sourceIdx = header.findIndex(h => h.trim().toLowerCase() === 'source');
+        const targetIdx = header.findIndex(h => h.trim().toLowerCase() === 'target');
 
         const items: TranslationItem[] = [];
-        for (let i = 1; i < lines.length; i++) {
-          if (!lines[i].trim()) continue;
-          const cols = lines[i].split(',');
-          const source = cols[sourceIdx]?.replace(/^"|"$/g, '').trim() || '';
-          const key = keyIdx !== -1 ? cols[keyIdx]?.replace(/^"|"$/g, '').trim() : `ряд_${i}`;
-          if (source) items.push({ id: i, key, source, status: 'pending', fileName: fileEntry.name });
+        for (let i = 1; i < rows.length; i++) {
+          const cols = rows[i];
+          if (cols.length === 1 && !cols[0].trim()) continue;
+
+          const source = sourceIdx !== -1 ? cols[sourceIdx]?.trim() : '';
+          const rawKey = keyIdx !== -1 ? cols[keyIdx]?.trim() : '';
+          const key = rawKey || `row_${i}`;
+          const target = targetIdx !== -1 ? cols[targetIdx]?.trim() : undefined;
+
+          if (source) {
+              items.push({ 
+                  id: i, 
+                  key, 
+                  source, 
+                  target,
+                  status: 'pending', 
+                  fileName: fileEntry.name 
+              });
+          }
         }
         resolve(items);
       };
@@ -155,30 +322,64 @@ const App: React.FC = () => {
     setCurrentItems(prev => prev.map(item => 
       item.id === id ? { ...item, target: newTarget, isEdited: true } : item
     ));
+    if (currentFileIndex >= 0) {
+         const fileName = fileQueue[currentFileIndex].name;
+         if (fileResultsRef.current[fileName]) {
+             fileResultsRef.current[fileName] = fileResultsRef.current[fileName].map(item => 
+                 item.id === id ? { ...item, target: newTarget, isEdited: true } : item
+             );
+         }
+    }
   };
 
   const reValidateItem = async (id: string | number) => {
     const item = currentItems.find(i => i.id === id);
-    if (!item || !translatorRef.current) return;
+    if (!item) return;
+
+    if (serviceType === 'gemini') {
+        if (!geminiTranslatorRef.current || geminiKeys.length === 0) {
+             addToast("Немає ключів Gemini", "error");
+             return;
+        }
+    } else {
+        if (!deepLTranslatorRef.current || !deepLKeyInput) {
+            addToast("Немає ключа DeepL", "error");
+            return;
+        }
+    }
 
     setCurrentItems(prev => prev.map(i => i.id === id ? { ...i, status: 'processing' } : i));
     
     try {
       const glossaryJson = JSON.stringify(glossary);
-      const results = await translatorRef.current.translateBatch([item], glossaryJson, apiKey);
+      let results;
+
+      if (serviceType === 'gemini') {
+        const currentKey = geminiKeys[activeKeyIndexRef.current % geminiKeys.length];
+        results = await geminiTranslatorRef.current?.translateBatch([item], glossaryJson, currentKey);
+      } else {
+        // Updated to pass glossaryJson
+        results = await deepLTranslatorRef.current?.translateBatch([item], deepLKeyInput, glossaryJson);
+      }
       
       if (results && results[0]) {
         const result = results[0];
-        setCurrentItems(prev => prev.map(i => 
-          i.id === id ? { 
-            ...i, 
-            target: result.translation, 
-            status: 'done', 
-            confidence: result.confidence, 
-            validationNote: result.critique,
-            isEdited: false 
-          } : i
-        ));
+        setCurrentItems(prev => {
+            const updated = prev.map(i => 
+                i.id === id ? { 
+                    ...i, 
+                    target: result.translation, 
+                    status: 'done' as const, 
+                    confidence: result.confidence, 
+                    validationNote: result.critique, 
+                    isEdited: false 
+                } : i
+            );
+            if (currentFileIndex >= 0) {
+                fileResultsRef.current[fileQueue[currentFileIndex].name] = updated;
+            }
+            return updated;
+        });
 
         if (result.confidence > 80) {
           const newTm = { ...tm, [item.source.trim()]: result.translation };
@@ -190,9 +391,9 @@ const App: React.FC = () => {
         }
       }
     } catch (err: any) {
-      if (err.message === 'RATE_LIMIT') {
-        setErrorMsg("Квота API вичерпана. Спробуйте пізніше.");
-        setCooldown(65);
+      if (err.message === 'RATE_LIMIT' && serviceType === 'gemini') {
+        activeKeyIndexRef.current = (activeKeyIndexRef.current + 1) % geminiKeys.length;
+        setErrorMsg("Ліміт на поточному ключі. Спробуйте ще раз.");
       } else {
         setErrorMsg(`Помилка: ${err.message}`);
       }
@@ -200,47 +401,106 @@ const App: React.FC = () => {
     }
   };
 
+  const stopProcessing = () => {
+      shouldStopRef.current = true;
+      setIsProcessing(false);
+      addToast("Обробку зупинено користувачем", "info");
+  };
+
   const startBatchProcess = async () => {
-    if (!translatorRef.current || fileQueue.length === 0 || isProcessing) return;
+    if (fileQueue.length === 0 || isProcessing) return;
+    
+    // Check Keys based on Service
+    if (serviceType === 'gemini') {
+         if (geminiKeys.length === 0) {
+             setErrorMsg("Введіть хоча б один ключ для Gemini API.");
+             return;
+         }
+    } else {
+         if (!deepLKeyInput) {
+             setErrorMsg("Введіть ключ для DeepL API.");
+             return;
+         }
+    }
+
+    shouldStopRef.current = false;
     setIsProcessing(true);
     setErrorMsg(null);
 
     let tempTm = { ...tm };
-    // Always iterate through queue. Reordering will change the order of iteration if index is used.
+    let consecutiveRateLimits = 0;
+    
     for (let fIdx = 0; fIdx < fileQueue.length; fIdx++) {
+      if (shouldStopRef.current) break;
       if (fileQueue[fIdx].status === 'done') continue;
-      const items = await processFileMetadata(fileQueue[fIdx]);
+      
+      const fileEntry = fileQueue[fIdx];
+      const items = await processFileMetadata(fileEntry);
+      
       setCurrentFileIndex(fIdx);
       setFileQueue(prev => prev.map((f, i) => i === fIdx ? { ...f, status: 'processing', totalItems: items.length } : f));
-      setStats(prev => ({ ...prev, totalStrings: prev.totalStrings + items.length }));
       setCurrentItems(items);
       
       let completedInFile = 0;
+      let cachedCountForFile = 0;
       const glossaryJson = JSON.stringify(glossary);
+      
       const updatedWithCache = items.map(item => {
+        if (item.status === 'done' || item.status === 'cached') {
+            completedInFile++;
+            return item;
+        }
         const cached = tempTm[item.source.trim()];
         if (cached) {
           completedInFile++;
+          cachedCountForFile++;
           return { ...item, target: cached, status: 'cached' as const, confidence: 100 };
         }
         return item;
       });
 
       setCurrentItems(updatedWithCache);
-      setStats(prev => ({ ...prev, cachedStrings: prev.cachedStrings + completedInFile, completedStrings: prev.completedStrings + completedInFile }));
+      if (cachedCountForFile > 0) {
+          setEventStats(prev => ({...prev, cachedStrings: prev.cachedStrings + cachedCountForFile}));
+      }
 
       const initialFileProg = Math.round((completedInFile / items.length) * 100);
       setFileQueue(prev => prev.map((f, idx) => idx === fIdx ? { ...f, progress: initialFileProg, completedItems: completedInFile } : f));
 
-      const pending = updatedWithCache.filter(i => i.status === 'pending');
-      for (let i = 0; i < pending.length; i += BATCH_SIZE) {
-        const batch = pending.slice(i, i + BATCH_SIZE);
+      const pending = updatedWithCache.filter(i => 
+          i.status === 'pending' || 
+          i.status === 'failed' || 
+          (i.status !== 'done' && i.status !== 'cached')
+      );
+
+      // Processing Loop
+      for (let i = 0; i < pending.length; i += batchSize) {
+        if (shouldStopRef.current) break;
+        
+        const batch = pending.slice(i, i + batchSize);
         const batchIds = batch.map(b => b.id);
         setCurrentItems(prev => prev.map(item => batchIds.includes(item.id) ? { ...item, status: 'processing' } : item));
 
         try {
-          const results = await translatorRef.current.translateBatch(batch, glossaryJson, apiKey);
+          let results: { id: number; translation: string; confidence: number; critique?: string }[] = [];
+
+          if (serviceType === 'gemini') {
+             const currentApiKey = geminiKeys[activeKeyIndexRef.current % geminiKeys.length];
+             if (geminiTranslatorRef.current) {
+                 results = await geminiTranslatorRef.current.translateBatch(batch, glossaryJson, currentApiKey);
+             }
+          } else {
+             // DeepL
+             if (deepLTranslatorRef.current) {
+                 // Updated to pass glossaryJson
+                 results = await deepLTranslatorRef.current.translateBatch(batch, deepLKeyInput, glossaryJson);
+             }
+          }
+          
+          consecutiveRateLimits = 0;
+
           const newEntries: Record<string, string> = {};
+          
           setCurrentItems(prev => {
             const next = [...prev];
             results.forEach(res => {
@@ -255,58 +515,118 @@ const App: React.FC = () => {
             });
             return next;
           });
+          
           tempTm = { ...tempTm, ...newEntries };
           completedInFile += results.length;
-          setStats(prev => ({ ...prev, apiCalls: prev.apiCalls + 1, completedStrings: prev.completedStrings + results.length }));
+          setEventStats(prev => ({ ...prev, apiCalls: prev.apiCalls + 1 }));
+          
           const fileProg = Math.round((completedInFile / items.length) * 100);
           setFileQueue(prev => prev.map((f, idx) => idx === fIdx ? { ...f, progress: fileProg, completedItems: completedInFile } : f));
           
-          await new Promise(r => setTimeout(r, WAIT_TIME_MS));
+          fileResultsRef.current[fileQueue[fIdx].name] = currentItems; 
+          
+          // Delay for API politeness
+          // If DeepL, we might need less delay, but keeping it consistent for now
+          await new Promise(r => setTimeout(r, serviceType === 'gemini' ? WAIT_TIME_MS : 1000));
+
         } catch (err: any) {
-          if (err.message === 'RATE_LIMIT') {
-            setErrorMsg("ПЕРЕВИЩЕНО КВОТУ API. ОЧІКУВАННЯ 60с...");
-            setCooldown(65);
-            await new Promise(r => setTimeout(r, RATE_LIMIT_WAIT_MS));
-            setErrorMsg(null);
-            i -= BATCH_SIZE; 
-            continue;
+          if (err.message === 'RATE_LIMIT' && serviceType === 'gemini') {
+            consecutiveRateLimits++;
+            
+            if (consecutiveRateLimits < geminiKeys.length) {
+                activeKeyIndexRef.current = (activeKeyIndexRef.current + 1) % geminiKeys.length;
+                const nextKeyIdx = activeKeyIndexRef.current + 1;
+                addToast(`Ліміт! Перемикання на ключ #${nextKeyIdx}`, "info");
+                i -= batchSize; 
+                continue;
+            } else {
+                setErrorMsg("ВСІ КЛЮЧІ ВИЧЕРПАЛИ ЛІМІТ. ОЧІКУВАННЯ 65с...");
+                setCooldown(65);
+                await new Promise(r => setTimeout(r, RATE_LIMIT_WAIT_MS));
+                consecutiveRateLimits = 0;
+                setErrorMsg(null);
+                i -= batchSize; 
+                continue;
+            }
+          } else if (err.message === 'RATE_LIMIT' && serviceType === 'deepl') {
+               setErrorMsg("DeepL API Rate Limit. Waiting 30s...");
+               await new Promise(r => setTimeout(r, 30000));
+               setErrorMsg(null);
+               i -= batchSize; // Retry
+               continue;
           } else {
             setCurrentItems(prev => prev.map(item => batchIds.includes(item.id) ? { ...item, status: 'failed' } : item));
-            setStats(prev => ({ ...prev, errors: prev.errors + 1 }));
-            setErrorMsg(`Помилка: ${err.message}`);
+            setEventStats(prev => ({ ...prev, errors: prev.errors + 1 }));
+            console.error(err);
+            await new Promise(r => setTimeout(r, 2000));
           }
         }
+        
+        setCurrentItems(latest => {
+             fileResultsRef.current[fileQueue[fIdx].name] = latest;
+             return latest;
+        });
       }
 
-      setCurrentItems(prev => {
-        fileResultsRef.current[fileQueue[fIdx].name] = prev;
-        return prev;
-      });
-      setFileQueue(prev => prev.map((f, idx) => idx === fIdx ? { ...f, status: 'done', progress: 100 } : f));
-      setStats(prev => ({ ...prev, completedFiles: prev.completedFiles + 1 }));
+      if (shouldStopRef.current) break;
+
+      const finalItems = fileResultsRef.current[fileQueue[fIdx].name] || [];
+      const isComplete = finalItems.every(it => it.status === 'done' || it.status === 'cached');
+      const hasErrors = finalItems.some(it => it.status === 'failed' || it.status === 'processing');
+      
+      setFileQueue(prev => prev.map((f, idx) => idx === fIdx ? { 
+          ...f, 
+          status: hasErrors ? 'error' : isComplete ? 'done' : 'pending',
+          progress: Math.round((finalItems.filter(it => it.status === 'done' || it.status === 'cached').length / (finalItems.length || 1)) * 100),
+          completedItems: finalItems.filter(it => it.status === 'done' || it.status === 'cached').length
+      } : f));
+
+      if (isComplete && !hasErrors) {
+          addToast(`Файл "${fileQueue[fIdx].name}" завершено`);
+      } else if (hasErrors) {
+           addToast(`Файл "${fileQueue[fIdx].name}" має пропуски`, "error");
+      }
+
       setTm(tempTm);
       localStorage.setItem('linguist_tm', JSON.stringify(tempTm));
-      addToast(`Файл "${fileQueue[fIdx].name}" завершено`);
     }
+    
     setIsProcessing(false);
-    addToast("Всі файли оброблено");
+    shouldStopRef.current = false;
+    if (!shouldStopRef.current) {
+        addToast("Чергу оброблено");
+    }
   };
 
-  const downloadFile = (fileName: string) => {
-    const results = fileResultsRef.current[fileName];
-    if (!results) return;
-    const header = "key,source,target,confidence,note\n";
-    const rows = results.map(item => `"${item.key}","${item.source.replace(/"/g, '""')}","${(item.target || '').replace(/"/g, '""')}","${item.confidence || ''}","${(item.validationNote || '').replace(/"/g, '""')}"`).join('\n');
+  const downloadFile = async (fileEntry: FileEntry) => {
+    let results = fileResultsRef.current[fileEntry.name];
+    
+    if (!results) {
+        try {
+            results = await processFileMetadata(fileEntry);
+        } catch (e) {
+            addToast("Помилка підготовки файлу", "error");
+            return;
+        }
+    }
+
+    if (!results || results.length === 0) {
+        addToast("Файл порожній", "error");
+        return;
+    }
+
+    const header = "key,source,target\n";
+    const rows = results.map(item => `"${item.key}","${item.source.replace(/"/g, '""')}","${(item.target || '').replace(/"/g, '""')}"`).join('\n');
     const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8-sig;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `localized_${fileName}`;
+    link.download = fileEntry.name;
     link.click();
     URL.revokeObjectURL(url);
   };
 
-  const downloadAll = () => {
+  const downloadAll = async () => {
     const completedFiles = fileQueue.filter(f => f.status === 'done');
     if (completedFiles.length === 0) {
       addToast("Немає завершених файлів для завантаження", "info");
@@ -314,18 +634,12 @@ const App: React.FC = () => {
     }
     
     completedFiles.forEach((file, index) => {
-      // Small delay to prevent browser download interruption
       setTimeout(() => {
-        downloadFile(file.name);
+        downloadFile(file);
       }, index * 200);
     });
     addToast(`Почато завантаження ${completedFiles.length} файлів`);
   };
-
-  const sessionPercentage = useMemo(() => {
-    if (stats.totalStrings === 0) return 0;
-    return Math.round((stats.completedStrings / stats.totalStrings) * 100);
-  }, [stats.completedStrings, stats.totalStrings]);
 
   return (
     <div className="flex h-screen w-full bg-[#020617] text-slate-400 p-4 md:p-6 lg:p-8 gap-6 overflow-hidden relative">
@@ -376,17 +690,23 @@ const App: React.FC = () => {
             <p className="text-[9px] text-slate-600 font-medium uppercase mt-1">Максимум 50 файлів</p>
           </div>
 
-          <button 
-            onClick={startBatchProcess} 
-            disabled={isProcessing || fileQueue.length === 0} 
-            className={`w-full py-3.5 rounded-xl font-black uppercase tracking-widest text-[10px] shadow-lg transition-all ${
-              isProcessing 
-              ? 'bg-slate-800 text-slate-600 cursor-not-allowed' 
-              : 'bg-white text-slate-950 hover:bg-blue-50 active:scale-[0.98]'
-            }`}
-          >
-            {isProcessing ? 'Процес іде...' : 'Розпочати'}
-          </button>
+          {!isProcessing ? (
+             <button 
+                onClick={startBatchProcess} 
+                disabled={fileQueue.length === 0} 
+                className="w-full py-3.5 rounded-xl font-black uppercase tracking-widest text-[10px] shadow-lg transition-all bg-white text-slate-950 hover:bg-blue-50 active:scale-[0.98] disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed"
+             >
+                Розпочати
+             </button>
+          ) : (
+             <button 
+                onClick={stopProcessing} 
+                className="w-full py-3.5 rounded-xl font-black uppercase tracking-widest text-[10px] shadow-lg transition-all bg-red-500 text-white hover:bg-red-400 active:scale-[0.98] flex items-center justify-center gap-2 animate-pop"
+             >
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>
+                Скасувати
+             </button>
+          )}
 
           {errorMsg && <p className="text-[9px] font-bold text-red-400 text-center animate-pop">{errorMsg}</p>}
           {cooldown > 0 && (
@@ -396,28 +716,91 @@ const App: React.FC = () => {
             </div>
           )}
 
-          <div className="pt-4 border-t border-white/5">
-             <div className="flex items-center justify-between mb-2">
-                <label className="text-[9px] font-black uppercase tracking-widest text-slate-500">Налаштування API Key</label>
-             </div>
-             <div className="flex gap-2">
+          <div className="pt-4 border-t border-white/5 space-y-4">
+             {/* BATCH SIZE CONTROL */}
+             <div>
+                <div className="flex items-center justify-between mb-2">
+                    <label className="text-[9px] font-black uppercase tracking-widest text-slate-500">Розмір батчу</label>
+                    <span className={`text-[10px] font-bold font-mono px-2 py-0.5 rounded ${batchSize > 20 ? 'text-amber-500 bg-amber-500/10' : 'text-blue-400 bg-blue-500/10'}`}>
+                        {batchSize}
+                    </span>
+                </div>
                 <input 
-                    type="password" 
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder="Вставте ключ Gemini..."
-                    className="flex-1 bg-white/[0.03] border border-white/5 hover:border-white/10 focus:border-blue-500/30 rounded-lg px-3 py-2 text-[10px] text-slate-300 outline-none transition-all placeholder:text-slate-700"
+                    type="range" 
+                    min="1" 
+                    max="50" 
+                    value={batchSize} 
+                    onChange={(e) => setBatchSize(Number(e.target.value))}
+                    disabled={isProcessing}
+                    className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:rounded-full hover:[&::-webkit-slider-thumb]:scale-125 transition-all"
                 />
-                <button 
-                    onClick={() => {
-                        localStorage.setItem('gemini_api_key', apiKey);
-                        addToast("Ключ збережено", "success");
-                    }}
-                    className="bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white px-3 rounded-lg text-[10px] font-bold transition-all border border-white/5"
-                    title="Зберегти ключ"
-                >
-                    💾
-                </button>
+             </div>
+
+             {/* API KEYS & SERVICE SELECTOR */}
+             <div className="flex flex-col gap-3">
+                <div className="flex bg-white/5 p-0.5 rounded-lg">
+                    <button 
+                        onClick={() => setServiceType('gemini')}
+                        className={`flex-1 py-1.5 text-[10px] font-bold uppercase tracking-widest rounded-md transition-all ${serviceType === 'gemini' ? 'bg-blue-500 text-white shadow' : 'text-slate-500 hover:text-slate-300'}`}
+                    >
+                        Gemini AI
+                    </button>
+                    <button 
+                        onClick={() => setServiceType('deepl')}
+                        className={`flex-1 py-1.5 text-[10px] font-bold uppercase tracking-widest rounded-md transition-all ${serviceType === 'deepl' ? 'bg-blue-500 text-white shadow' : 'text-slate-500 hover:text-slate-300'}`}
+                    >
+                        DeepL API
+                    </button>
+                </div>
+
+                <div>
+                    <div className="flex items-center justify-between mb-2">
+                        <label className="text-[9px] font-black uppercase tracking-widest text-slate-500">
+                            {serviceType === 'gemini' ? `Keys (Active: #${activeKeyIndexRef.current % (geminiKeys.length || 1) + 1})` : 'DeepL Auth Key'}
+                        </label>
+                    </div>
+                    {serviceType === 'gemini' ? (
+                        <div className="flex flex-col gap-2">
+                            <textarea 
+                                value={geminiKeysInput}
+                                onChange={(e) => setGeminiKeysInput(e.target.value)}
+                                placeholder="Key 1, Key 2, Key 3..."
+                                className="flex-1 bg-white/[0.03] border border-white/5 hover:border-white/10 focus:border-blue-500/30 rounded-lg px-3 py-2 text-[10px] text-slate-300 outline-none transition-all placeholder:text-slate-700 min-h-[60px] resize-y"
+                            />
+                            <button 
+                                onClick={() => {
+                                    localStorage.setItem('gemini_api_key', geminiKeysInput);
+                                    addToast(`Збережено ${geminiKeys.length} ключ(ів)`, "success");
+                                }}
+                                className="bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white px-3 py-2 rounded-lg text-[10px] font-bold transition-all border border-white/5 w-full uppercase tracking-widest"
+                            >
+                                Зберегти Gemini
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="flex flex-col gap-2">
+                            <input 
+                                type="password"
+                                value={deepLKeyInput}
+                                onChange={(e) => setDeepLKeyInput(e.target.value)}
+                                placeholder="DeepL Auth Key (ends with :fx for Free)"
+                                className="flex-1 bg-white/[0.03] border border-white/5 hover:border-white/10 focus:border-blue-500/30 rounded-lg px-3 py-2 text-[10px] text-slate-300 outline-none transition-all placeholder:text-slate-700"
+                            />
+                            <div className="text-[9px] text-slate-500 px-1">
+                                * Підтримує Free (:fx) та Pro версії
+                            </div>
+                            <button 
+                                onClick={() => {
+                                    localStorage.setItem('deepl_api_key', deepLKeyInput);
+                                    addToast(`Ключ DeepL збережено`, "success");
+                                }}
+                                className="bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white px-3 py-2 rounded-lg text-[10px] font-bold transition-all border border-white/5 w-full uppercase tracking-widest"
+                            >
+                                Зберегти DeepL
+                            </button>
+                        </div>
+                    )}
+                </div>
              </div>
           </div>
         </section>
@@ -457,12 +840,17 @@ const App: React.FC = () => {
              <div className="flex items-center gap-3">
                 <div className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-blue-500 animate-pulse' : 'bg-slate-700'}`}></div>
                 <h3 className="font-bold text-[10px] uppercase tracking-widest text-slate-400 truncate max-w-[400px]">
-                  {currentFileIndex >= 0 ? `Процес: ${fileQueue[currentFileIndex].name}` : 'Двигун в режимі очікування'}
+                  {currentFileIndex >= 0 ? 
+                      (fileQueue[currentFileIndex] ? `Процес: ${fileQueue[currentFileIndex].name}` : 'Виберіть файл') 
+                    : 'Двигун в режимі очікування'}
                 </h3>
              </div>
              <div className="flex items-center gap-4">
+                <span className={`text-[9px] font-bold font-mono px-2 py-0.5 rounded border ${serviceType === 'gemini' ? 'text-blue-300 bg-blue-500/10 border-blue-500/20' : 'text-indigo-300 bg-indigo-500/10 border-indigo-500/20'}`}>
+                    {serviceType === 'gemini' ? 'Gemini AI' : 'DeepL API'}
+                </span>
                 {isProcessing && (
-                   <span className="text-[9px] font-bold font-mono text-blue-400 bg-blue-500/10 px-2.5 py-1 rounded-full animate-pop border border-blue-500/20">
+                   <span className="text-[9px] font-bold font-mono text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-full animate-pop border border-emerald-500/20">
                       Sync: {sessionPercentage}%
                    </span>
                 )}
@@ -499,7 +887,7 @@ const App: React.FC = () => {
                       <code className="text-[10px] text-blue-400/80 font-mono bg-blue-500/5 px-1.5 py-0.5 rounded border border-blue-500/10 block truncate">{item.key}</code>
                     </td>
                     <td className="p-4 align-top">
-                      <p className="text-slate-400 leading-relaxed break-words">{item.source}</p>
+                      <p className="text-slate-400 leading-relaxed break-words whitespace-pre-wrap font-mono text-[11px]">{item.source}</p>
                     </td>
                     <td className="p-4 align-top">
                       <div className="flex flex-col gap-2 min-h-[32px]">
@@ -607,8 +995,20 @@ const App: React.FC = () => {
                         idx === currentFileIndex 
                         ? 'bg-blue-500/10 border-blue-500/30 ring-2 ring-blue-500/10 active-sync-pulse' 
                         : 'bg-white/[0.01] border-white/5 hover:border-white/10'
-                    }`}
+                    } relative`}
                     style={{ animationDelay: `${idx * 0.05}s` }}
+                    onClick={() => {
+                        if (!isProcessing) {
+                            setCurrentFileIndex(idx);
+                            const fileName = file.name;
+                            if (fileResultsRef.current[fileName]) {
+                                setCurrentItems(fileResultsRef.current[fileName]);
+                            } else {
+                                // Fallback if ref is empty (shouldn't happen often)
+                                processFileMetadata(file).then(setCurrentItems);
+                            }
+                        }
+                    }}
                 >
                   <div className="flex justify-between items-start mb-2.5">
                     <div className="max-w-[140px]">
@@ -618,25 +1018,53 @@ const App: React.FC = () => {
                       </div>
                     </div>
                     
-                    <div className="flex items-center gap-1">
-                      {/* Reorder controls */}
-                      {!isProcessing && (
-                        <div className="flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity mr-2">
-                           <button onClick={() => moveFile(idx, -1)} disabled={idx === 0} className="text-slate-600 hover:text-slate-300 disabled:opacity-20">
-                             <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+                    <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                      {/* Reorder/Action controls */}
+                      <div className={`flex items-center gap-1 transition-all ${isProcessing && idx === currentFileIndex ? 'opacity-0' : 'opacity-100'} absolute right-3 bg-slate-900/80 backdrop-blur rounded-lg p-1 border border-white/10 shadow-lg z-10`}>
+                           {/* Retry Button */}
+                           {(file.status === 'done' || file.status === 'error' || file.status === 'pending') && (
+                               <button 
+                                 onClick={() => handleRetryFile(idx)}
+                                 className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500/20 text-slate-400 hover:text-blue-400 transition-colors"
+                                 title="Перевірити та доперекласти"
+                               >
+                                 <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>
+                               </button>
+                           )}
+                           
+                           {/* NEW: Always available Download button */}
+                           <button 
+                               onClick={(e) => { e.stopPropagation(); downloadFile(file); }} 
+                               className="w-6 h-6 flex items-center justify-center rounded hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-400 transition-colors"
+                               title="Завантажити поточний стан"
+                           >
+                               <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                            </button>
-                           <button onClick={() => moveFile(idx, 1)} disabled={idx === fileQueue.length - 1} className="text-slate-600 hover:text-slate-300 disabled:opacity-20">
-                             <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                           
+                           {/* Move Up */}
+                           <button onClick={() => moveFile(idx, -1)} disabled={idx === 0} className="w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 text-slate-400 hover:text-white disabled:opacity-30">
+                             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m18 15-6-6-6 6"/></svg>
                            </button>
-                        </div>
-                      )}
+                           
+                           {/* Move Down */}
+                           <button onClick={() => moveFile(idx, 1)} disabled={idx === fileQueue.length - 1} className="w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 text-slate-400 hover:text-white disabled:opacity-30">
+                             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                           </button>
+
+                           {/* Delete */}
+                           <button onClick={() => deleteFile(idx)} className="w-6 h-6 flex items-center justify-center rounded hover:bg-red-500/20 text-slate-400 hover:text-red-400 transition-colors">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+                           </button>
+                      </div>
 
                       {file.status === 'done' ? (
-                        <button onClick={() => downloadFile(file.name)} className="w-8 h-8 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white rounded-lg flex items-center justify-center transition-all animate-pop border border-emerald-500/20">
+                        <button onClick={() => downloadFile(file)} className="w-8 h-8 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white rounded-lg flex items-center justify-center transition-all animate-pop border border-emerald-500/20">
                           <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                         </button>
                       ) : file.status === 'processing' ? (
                         <div className="w-5 h-5 border-2 border-blue-500/20 border-t-blue-500 rounded-full animate-spin"></div>
+                      ) : file.status === 'error' ? (
+                        <span className="text-[8px] font-bold text-red-400 bg-red-500/10 px-2 py-0.5 rounded uppercase tracking-widest border border-red-500/20">Error</span>
                       ) : (
                         <span className="text-[8px] font-bold text-slate-700 bg-white/5 px-2 py-0.5 rounded uppercase tracking-widest">Wait</span>
                       )}
@@ -644,7 +1072,7 @@ const App: React.FC = () => {
                   </div>
                   <div className="w-full bg-white/5 h-[3px] rounded-full overflow-hidden">
                     <div 
-                      className={`h-full progress-bar-transition ${file.status === 'done' ? 'bg-emerald-500' : 'bg-blue-500'}`} 
+                      className={`h-full progress-bar-transition ${file.status === 'done' ? 'bg-emerald-500' : file.status === 'error' ? 'bg-red-500' : 'bg-blue-500'}`} 
                       style={{ width: `${file.progress}%` }}
                     ></div>
                   </div>

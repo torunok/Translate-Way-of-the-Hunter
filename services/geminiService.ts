@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { TranslationItem } from "../types";
 import { SYSTEM_INSTRUCTION_BASE } from "../constants";
@@ -44,7 +45,7 @@ export class GeminiTranslator {
     try {
       const response = await ai.models.generateContent({
         model,
-        contents: `Process the following game strings. If a translation is provided, validate and improve it. Otherwise, translate from scratch:\n${JSON.stringify(promptItems)}`,
+        contents: `Process the following game strings. If a translation is provided, validate and improve it. Otherwise, translate from scratch. IMPORTANT: Preserve specific formatting (newlines, spacing) from the source:\n${JSON.stringify(promptItems)}`,
         config: {
           systemInstruction,
           temperature: 0.1, // Більш стабільні результати для валідації
